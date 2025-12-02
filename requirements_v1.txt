@@ -1,6 +1,0 @@
-streamlit
-pdfplumber
-pandas
-PyPDF2
-reportlab
-openpyxl
