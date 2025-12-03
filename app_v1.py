@@ -264,7 +264,10 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
         any_data_for_group = False
 
         for nr in orders:
-            d = wyniki.get(nr, wyniki.get(int(nr), {}))
+            # --- POPRAWKA: zawsze traktujemy nr jako string, bez int(nr) ---
+            key = str(nr).strip()
+            d = wyniki.get(key, {})
+
             if any(
                 d.get(k) is not None
                 for k in ("netto", "adres_dostawy", "numer_przesylki")
@@ -286,7 +289,7 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
 
         # Ręcznie nadpisujemy adresy dla konkretnych jedno-zleceniowych grup
         if len(orders) == 1:
-            nr_single = str(orders[0])
+            nr_single = str(orders[0]).strip()
             if nr_single in SPECJALNE_ADRESY_DOSTAWY:
                 adres = SPECJALNE_ADRESY_DOSTAWY[nr_single]
 
@@ -333,41 +336,6 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
     df = pd.DataFrame(rows)
     return df, total_netto, total_palety
 
-
-# --------- PARSOWANIE WKLEJONEJ TABELI ---------
-
-
-def parse_groups_from_pasted(text):
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    groups = []
-    current = None
-
-    for line in lines:
-        parts = re.split(r"\t+| {2,}", line)
-        parts = [p.strip() for p in parts if p.strip()]
-        if not parts:
-            continue
-
-        if parts[0].isdigit():
-            label = parts[0]
-            orders = [p.strip() for p in parts[1].split("+")]
-            mp = parts[2] if len(parts) > 2 else None
-            ilosc_pal_tekst = parts[3] if len(parts) > 3 else ""
-            przewoznik = parts[4] if len(parts) > 4 else ""
-
-            current = {
-                "label": label,
-                "orders": orders,
-                "mp": mp,
-                "ilosc_pal_tekst": ilosc_pal_tekst,
-                "przewoznik": przewoznik,
-            }
-            groups.append(current)
-        else:
-            continue
-
-    df_preview = pd.DataFrame(groups)
-    return groups, df_preview
 
 
 # --------- GENEROWANIE PDF Z PODSUMOWANIEM ---------
