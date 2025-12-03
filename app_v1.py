@@ -150,15 +150,18 @@ def znajdz_adres_dostawy(linie):
     if start is None or end is None or end <= start:
         return None
 
+    # wyciągamy blok między "Adresat/Consignee" a "Adres nabywcy"
     blok = [l.strip() for l in linie[start:end] if l.strip()]
     if not blok:
         return None
 
+    # czyścimy techniczne linie (nasz adres nadawcy itp.)
     cleaned = []
     for l in blok:
         if "Nadawca/Consignor" in l:
             continue
         words = l.split()
+        # wyrzucamy NIEPRUSZEWO (żeby nie brać adresu zakładu)
         words = [w for w in words if w.upper() != "NIEPRUSZEWO"]
         if not words:
             continue
@@ -167,6 +170,7 @@ def znajdz_adres_dostawy(linie):
     if not cleaned:
         return None
 
+    # dzielimy na segmenty po "POLAND" – każdy segment to jeden adres
     segments = []
     current = []
     for l in cleaned:
@@ -180,6 +184,7 @@ def znajdz_adres_dostawy(linie):
     if not segments:
         return None
 
+    # pierwszy segment to zazwyczaj zakład (Kasztanowa 4, BUK) – go pomijamy
     def is_plant_segment(seg):
         txt = " ".join(seg).upper()
         return ("64-320" in txt) or (" BUK" in txt) or ("KASZTANOWA" in txt)
@@ -189,6 +194,8 @@ def znajdz_adres_dostawy(linie):
     if non_plant_segments:
         selected = non_plant_segments[0]
     else:
+        # awaryjnie: bierzemy drugi segment jeśli jest,
+        # inaczej ostatni
         if len(segments) >= 2:
             selected = segments[1]
         else:
@@ -198,7 +205,12 @@ def znajdz_adres_dostawy(linie):
     if not selected:
         return None
 
-    return ", ".join(selected)
+    # NOWY FORMAT: wszystko w jednej linii ze spacjami
+    # (bez przecinków, bez złamań linii)
+    adres = " ".join(selected)
+    adres = re.sub(r"\s+", " ", adres).strip()
+    return adres
+
 
 
 # --------- GŁÓWNA LOGIKA: PDF ---------
