@@ -499,7 +499,7 @@ def main():
 
         # Excel
         excel_buf = io.BytesIO()
-        with pd.ExcelWriter(excel_buf, engine="xlsxwriter") as w:
+        with pd.ExcelWriter(excel_buf, engine="openpyxl") as w:
             df_zam.to_excel(w, sheet_name="Zamówienia", index=False)
             df_summary.to_excel(w, sheet_name="Podsumowanie", index=False)
         excel_buf.seek(0)
