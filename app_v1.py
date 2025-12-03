@@ -114,7 +114,6 @@ def znajdz_wage_netto_podsumowanie(linie):
             header_idx = i
             break
     if header_idx is None:
-        # fallback - szukamy samej frazy
         for i, linia in enumerate(linie):
             if "Całkowita waga netto" in linia or "Total Net Weight" in linia:
                 header_idx = i
@@ -139,7 +138,6 @@ def znajdz_numer_przesylki(linie):
     if not linie:
         return None
 
-    # klasyczne "Numer przesyłki"
     for i, linia in enumerate(linie):
         low = linia.lower()
         if "numer przesy" in low or "nr przesy" in low:
@@ -148,7 +146,6 @@ def znajdz_numer_przesylki(linie):
                 if nums:
                     return nums[-1]
 
-    # fallback po QUALITY CERTIFICATE
     for i, linia in enumerate(linie):
         if "QUALITY CERTIFICATE" in linia.upper():
             for j in range(i + 1, min(i + 5, len(linie))):
@@ -180,7 +177,6 @@ def znajdz_adres_dostawy(linie):
     if not blok:
         return None
 
-    # czyścimy oczywisty adres zakładu (Niepruszewo / Kasztanowa / Buk)
     cleaned = []
     for l in blok:
         upper = l.upper()
@@ -226,13 +222,11 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
 
             first_page_idx = strony[0]
 
-            # adres z PDF (zostanie potem nadpisany mapą, jeśli jest w ADRESY_ZLECEN)
             if wyniki[nr]["adres_dostawy"] is None:
                 adres = znajdz_adres_dostawy(pages_lines[first_page_idx])
                 if adres:
                     wyniki[nr]["adres_dostawy"] = adres
 
-            # numer przesyłki – szukamy na wszystkich stronach z tym zleceniem + ew. strona po
             if wyniki[nr]["numer_przesylki"] is None:
                 numer_p = None
                 for page_idx in strony:
@@ -248,7 +242,6 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
                 if numer_p:
                     wyniki[nr]["numer_przesylki"] = numer_p
 
-            # waga netto – szukamy w podsumowaniach na stronach z tym zleceniem + ew. stronie po
             netto = None
             for idx in strony:
                 val = znajdz_wage_netto_podsumowanie(pages_lines[idx])
@@ -267,7 +260,6 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
 
             wyniki[nr]["netto"] = netto
 
-    # adresy nadpisujemy mapą z Excela (jeśli istnieje)
     for nr, dane in wyniki.items():
         addr = ADRESY_ZLECEN.get(str(nr))
         if addr:
@@ -287,7 +279,6 @@ def parse_groups_from_pasted(text: str):
     if not text.strip():
         raise ValueError("Pole z tabelą jest puste – wklej dane z Excela.")
 
-    # Excel kopiuje dane jako TSV (tabulatory)
     if "\t" in text:
         sep = "\t"
     elif ";" in text:
@@ -295,7 +286,6 @@ def parse_groups_from_pasted(text: str):
     else:
         sep = ","
 
-    # Najpierw próbujemy jak zwykle – z nagłówkiem
     buffer = io.StringIO(text.strip())
     df_try = pd.read_csv(buffer, sep=sep, engine="python")
 
@@ -313,7 +303,6 @@ def parse_groups_from_pasted(text: str):
         col_ilosc = norm_to_orig.get("iloscpalet")
         col_przew = norm_to_orig.get("przewoznik")
     else:
-        # brak prawidłowych nagłówków – traktujemy dane jako 4 kolumny bez nagłówka
         buffer2 = io.StringIO(text.strip())
         df = pd.read_csv(buffer2, sep=sep, header=None, engine="python")
         if df.shape[1] < 4:
@@ -332,7 +321,6 @@ def parse_groups_from_pasted(text: str):
     for _, row in df.iterrows():
         zlec_raw = row.get(col_zlec, "")
         zlec = str(zlec_raw).strip()
-        # pomijamy ewentualny nagłówek skopiowany jako wiersz
         if not zlec or zlec.lower() == "nan" or _normalize_colname(zlec) == "zlecenie":
             continue
 
@@ -398,7 +386,6 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
         any_netto = False
         przesylki = []
 
-        # wybór adresu: wg największej wagi netto
         best_addr = None
         best_addr_netto = -1.0
         fallback_addr = None
@@ -603,28 +590,45 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
                 res.append([h])
         return res
 
+    # ====== TU JEST NOWA FUNKCJA Z WYŚRODKOWANIEM ======
     def draw_row_frame_and_text(y, h, texts_lines, bold_flags):
+        """
+        Rysuje komórki tabeli z wyśrodkowaniem:
+        - poziomo (środek kolumny)
+        - pionowo (środek komórki)
+        """
         line_height = 11
         num_cols = len(col_x)
+
         for i in range(num_cols):
             x = col_x[i]
             w = col_widths[i]
+
+            # ramka komórki
             c.rect(x, y - h, w, h)
 
             lines = texts_lines[i]
             if not isinstance(lines, (list, tuple)):
-                lines = [str(lines)]
+                lines = ["" if lines is None else str(lines)]
+            else:
+                lines = ["" if ln is None else str(ln) for ln in lines]
 
-            total_lines_height = len(lines) * line_height
-            start_y_text = y - (h + total_lines_height) / 2 + line_height
+            if len(lines) == 0:
+                continue
+
+            total_text_height = len(lines) * line_height
+            y_center = y - h / 2
+            start_y = y_center + total_text_height / 2 - line_height
+
+            font_size = 10 if bold_flags[i] else 9
+            c.setFont(FONT_NAME, font_size)
 
             for j, txt in enumerate(lines):
-                txt = str(txt)
-                if bold_flags[i]:
-                    c.setFont(FONT_NAME, 10)
-                else:
-                    c.setFont(FONT_NAME, 9)
-                c.drawString(x + 3, start_y_text - j * line_height, txt)
+                text_width = c.stringWidth(txt, FONT_NAME, font_size)
+                text_x = x + (w / 2) - (text_width / 2)
+                text_y = start_y - j * line_height
+                c.drawString(text_x, text_y, txt)
+    # ===================================================
 
     def new_page(suffix="(cd.)"):
         c.showPage()
@@ -684,7 +688,6 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
     last_x = col_x[-1]
     last_w = col_widths[-1]
 
-    # CAŁKOWITA WAGA NETTO
     c.rect(col_x[0], y - row_height, big_width, row_height)
     c.rect(last_x, y - row_height, last_w, row_height)
 
@@ -698,11 +701,10 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
 
     y -= row_height
 
-    # ILOŚĆ MIEJSC PALETOWYCH
     c.rect(col_x[0], y - row_height, big_width, row_height)
     c.rect(last_x, y - row_height, last_w, row_height)
 
-    label2 = "ILOŚĆ MIEJSC PALETOWYCH (mp)"
+    label2 = "CAŁKOWITA ILOŚĆ MIEJSC PALETOWYCH (mp)"
     c.setFont(FONT_NAME, 10)
     c.drawString(col_x[0] + 6, y - row_height / 2, label2)
 
