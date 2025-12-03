@@ -713,7 +713,7 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
     c.rect(col_x[0], y - row_height, big_width, row_height)
     c.rect(last_x, y - row_height, last_w, row_height)
 
-    label2 = "CAŁKOWITA ILOŚĆ PALET (mp)"
+    label2 = "CAŁKOWITA ILOŚĆ MIEJSC PALETOWYCH"
     c.setFont(FONT_NAME, 10)
     c.drawString(col_x[0] + 6, y - row_height / 2, label2)
 
