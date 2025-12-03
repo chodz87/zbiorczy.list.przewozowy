@@ -46,14 +46,23 @@ LOGO_PATH = get_logo_path()
 # --------- POMOCNICZE ---------
 
 def wyczysc_liczbe(tekst):
+    """
+    Czyści liczby typu:
+    - "1", "1,5", "2.3"
+    - "1p", "2 p", "3kg" -> bierze tylko część numeryczną
+    """
     if tekst is None:
         return None
     tekst = str(tekst)
     tekst = tekst.replace("\u00a0", "")
     tekst = tekst.replace(" ", "")
-    tekst = tekst.replace(",", ".")
+    # wyciągamy pierwszą liczbę z tekstu
+    nums = re.findall(r"[0-9.,]+", tekst)
+    if not nums:
+        return None
+    num = nums[0].replace(",", ".")
     try:
-        return float(tekst)
+        return float(num)
     except ValueError:
         return None
 
@@ -261,29 +270,16 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
     return wyniki, strony_do_zachowania
 
 
-# --------- PARSOWANIE WKLEJONEJ TABELI ---------
+# --------- PARSOWANIE TABELI Z DATA_EDITOR ---------
 
-def parse_groups_from_pasted(text: str):
+def parse_groups_from_df(df: pd.DataFrame):
     """
-    Wklejasz 4 kolumny z Excela:
-    ZLECENIE | ilość palet | przewoźnik | mp
-
-    Zwraca:
-      - groups: lista słowników (label, orders, mp, ilosc_pal_tekst, przewoznik)
-      - df_input: DataFrame z wklejonymi danymi (do podglądu)
+    Oczekuje DataFrame z kolumnami:
+      ZLECENIE | ilość palet | przewoźnik | mp
+    (nazwy mogą mieć różne znaki, ważna jest treść)
     """
-    if not text.strip():
-        raise ValueError("Pole z tabelą jest puste.")
-
-    if "\t" in text:
-        sep = "\t"
-    elif ";" in text:
-        sep = ";"
-    else:
-        sep = ","  # awaryjnie, gdyby ktoś użył CSV
-
-    buffer = io.StringIO(text.strip())
-    df = pd.read_csv(buffer, sep=sep, engine="python")
+    if df is None or df.empty:
+        raise ValueError("Tabela jest pusta – wklej dane z Excela.")
 
     norm_to_orig = {}
     for col in df.columns:
@@ -291,21 +287,22 @@ def parse_groups_from_pasted(text: str):
         norm_to_orig[norm] = col
 
     if "zlecenie" not in norm_to_orig:
-        raise ValueError("Nie znaleziono kolumny 'ZLECENIE' w wklejonej tabeli.")
+        raise ValueError("Nie znaleziono kolumny 'ZLECENIE' w tabeli.")
 
     if "mp" not in norm_to_orig:
-        raise ValueError("Nie znaleziono kolumny 'mp' w wklejonej tabeli.")
+        raise ValueError("Nie znaleziono kolumny 'mp' w tabeli.")
 
     col_zlec = norm_to_orig["zlecenie"]
     col_mp = norm_to_orig["mp"]
-    col_ilosc = norm_to_orig.get("iloscpalet")  # kolumna 'ilość palet'
+    col_ilosc = norm_to_orig.get("iloscpalet")
     col_przew = norm_to_orig.get("przewoznik")
 
     groups = []
     for _, row in df.iterrows():
         zlec_raw = row.get(col_zlec, "")
         zlec = str(zlec_raw).strip()
-        if not zlec or zlec.lower() == "nan":
+        # pomijamy pusty wiersz i ew. nagłówek wklejony jako wiersz
+        if not zlec or zlec.lower() == "nan" or _normalize_colname(zlec) == "zlecenie":
             continue
 
         raw_mp = row.get(col_mp, None)
@@ -336,13 +333,9 @@ def parse_groups_from_pasted(text: str):
         })
 
     if not groups:
-        raise ValueError("Nie udało się odczytać żadnych zleceń z wklejonej tabeli.")
+        raise ValueError("Nie udało się odczytać żadnych zleceń z tabeli.")
 
-    # DataFrame do podglądu – bierzemy tylko istniejące kolumny
-    cols_for_preview = [c for c in [col_zlec, col_ilosc, col_przew, col_mp] if c is not None]
-    df_preview = df[cols_for_preview].copy()
-
-    return groups, df_preview
+    return groups
 
 
 def zbuduj_podsumowanie_grup(wyniki, groups):
@@ -350,6 +343,7 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
     Tworzy DataFrame z podsumowaniem:
     - sumuje wagę netto dla zleceń połączonych
     - sumuje mp (ilość palet)
+    - IGNORUJE grupy, dla których żadne zlecenie nie istnieje w PDF
     """
     rows = []
     total_netto = 0.0
@@ -367,8 +361,14 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
         adres = None
         przesylki = []
 
+        # sprawdzamy, czy JAKIEKOLWIEK zlecenie z grupy istnieje w PDF
+        any_data_for_group = False
+
         for nr in orders:
             d = wyniki.get(nr, {})
+            if any(d.get(k) is not None for k in ("netto", "adres_dostawy", "numer_przesylki")):
+                any_data_for_group = True
+
             n = d.get("netto")
             if n is not None:
                 any_netto = True
@@ -379,6 +379,10 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
                 adres = d["adres_dostawy"]
             if d.get("numer_przesylki"):
                 przesylki.append(str(d["numer_przesylki"]))
+
+        # JEŚLI ŻADNE ze zleceń z tej grupy nie wystąpiło w PDF -> POMIJAMY CAŁY WIERSZ
+        if not any_data_for_group:
+            continue
 
         netto_value = netto_sum if any_netto else None
         if netto_value is not None:
@@ -632,7 +636,7 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
     c.setFont(FONT_NAME, 10)
     c.drawString(col_x[0] + 6, y - row_height / 2, label2)
 
-    palety_txt = f"{int(total_palety)}" if float(total_palety).is_integer() else f"{total_palety}"
+    palety_txt = f"{int(total_palety)}" if total_palety is not None and float(total_palety).is_integer() else f"{total_palety}"
     c.setFont(FONT_NAME, bold_font_size)
     c.drawString(col_x[3] + 6, y - row_height / 2, palety_txt)
     c.drawString(col_x[3] + 6.4, y - row_height / 2, palety_txt)
@@ -674,16 +678,19 @@ def main():
     st.markdown(
         "### 1. Skopiuj z Excela 4 kolumny (C–F)\n"
         "- **ZLECENIE**\n"
-        "- **ilość palet** (kolumna opisowa)\n"
+        "- **ilość palet** (opis – będzie w Excelu jako kolumna 'Ilość palet')\n"
         "- **przewoźnik**\n"
         "- **mp** – liczba palet (będzie sumowana)\n\n"
-        "Następnie wklej dane poniżej (Ctrl+V)."
+        "Następnie kliknij w pierwszą komórkę tabeli poniżej i wklej (**Ctrl+V**)."
     )
 
-    tabela_text = st.text_area(
-        "Wklej tutaj dane skopiowane z Excela (razem z nagłówkami):",
-        height=200,
-        placeholder="ZLECENIE\tilość palet\tprzewoźnik\tmp\n53493+53498\tkarton\tdpd\t1\n56997+56998\t1p\tdsv\t1",
+    # Pusta tabela jak w Excelu – użytkownik wkleja dane bezpośrednio
+    empty_df = pd.DataFrame(columns=["ZLECENIE", "ilość palet", "przewoźnik", "mp"])
+    df_input = st.data_editor(
+        empty_df,
+        num_rows="dynamic",
+        key="input_table",
+        use_container_width=True,
     )
 
     if st.button("Generuj Excel + PDF (ze zbiorczą stroną)"):
@@ -692,14 +699,14 @@ def main():
             return
 
         try:
-            groups, df_input = parse_groups_from_pasted(tabela_text)
+            groups = parse_groups_from_df(df_input)
         except Exception as e:
-            st.error(f"Błąd podczas interpretacji wklejonej tabeli: {e}")
+            st.error(f"Błąd w tabeli: {e}")
             return
 
         # podgląd wklejonej tabeli (ładna siatka jak w Excelu)
         st.subheader("Wklejona tabela (z Excela)")
-        st.dataframe(df_input)
+        st.dataframe(df_input, use_container_width=True)
 
         all_orders = sorted({o for g in groups for o in g["orders"]})
 
@@ -712,7 +719,7 @@ def main():
                 wyniki, strony = przetworz_zamowienia(tmp_pdf_path, all_orders)
 
                 if len(strony) == 0:
-                    st.error("Nie znaleziono żadnych stron z podanymi numerami zamówień.")
+                    st.error("Nie znaleziono żadnych stron z podanymi zleceniami w PDF.")
                     return
 
                 df_summary, total_netto, total_palety = zbuduj_podsumowanie_grup(wyniki, groups)
@@ -737,7 +744,7 @@ def main():
 
                 st.success("Gotowe! Poniżej możesz pobrać pliki.")
                 st.write(f"**Suma wag netto:** {round(total_netto, 2)} kg")
-                st.write(f"**Suma palet (mp):** {total_palety}")
+                st.write(f"**Suma palet (mp, tylko dla zleceń znalezionych w PDF):** {total_palety}")
 
                 st.download_button(
                     label="Pobierz Excel (z paletami)",
@@ -753,8 +760,8 @@ def main():
                     mime="application/pdf",
                 )
 
-                st.subheader("Podsumowanie (wg wklejonych zleceń)")
-                st.dataframe(df_summary)
+                st.subheader("Podsumowanie (tylko zlecenia znalezione w PDF)")
+                st.dataframe(df_summary, use_container_width=True)
 
             finally:
                 try:
