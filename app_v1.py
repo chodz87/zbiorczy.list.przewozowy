@@ -4,6 +4,8 @@ import os
 import tempfile
 from datetime import datetime
 
+import math
+
 import pdfplumber
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
@@ -14,7 +16,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 import streamlit as st
 
-# --------- MAPA ADRESÓW (z Excela) ---------
+# =================== MAPA ADRESÓW ===================
 
 ADRESY_ZLECEN = {
     "59743": "EMI Chopina 22 62-025 Kostrzyn Wlkp POLAND",
@@ -29,8 +31,7 @@ ADRESY_ZLECEN = {
     "60175": "BOFERM SP. Z O.O. Górki 13 08-210 Platerów POLAND",
 }
 
-# --------- FONT + LOGO ---------
-
+# =================== FONT + LOGO ===================
 
 def init_font():
     try:
@@ -60,21 +61,21 @@ def get_logo_path():
 FONT_NAME = init_font()
 LOGO_PATH = get_logo_path()
 
-# --------- POMOCNICZE ---------
+# =================== POMOCNICZE ===================
 
-
-def wyczysc_liczbe(tekst):
-    """
-    Czyści liczby typu:
-    - 1, 1,5, 2.3
-    - 1p, 2 p, 3kg -> bierze tylko część numeryczną
-    """
-    if tekst is None:
+def wyczysc_liczbe(val):
+    """Zamienia '1 234,56' / '1p' / NaN na float albo None."""
+    if val is None:
         return None
-    tekst = str(tekst)
-    tekst = tekst.replace("\u00a0", "")
-    tekst = tekst.replace(" ", "")
-    nums = re.findall(r"[0-9.,]+", tekst)
+    if isinstance(val, (int, float)):
+        if isinstance(val, float) and math.isnan(val):
+            return None
+        return float(val)
+    text = str(val).strip()
+    if not text or text.lower() == "nan":
+        return None
+    text = text.replace("\xa0", "").replace(" ", "")
+    nums = re.findall(r"[0-9.,]+", text)
     if not nums:
         return None
     num = nums[0].replace(",", ".")
@@ -85,79 +86,84 @@ def wyczysc_liczbe(tekst):
 
 
 def _normalize_colname(name: str) -> str:
-    # normalizacja nazw kolumn (usuwamy polskie znaki, spacje)
+    """Normalizacja nazw kolumn (bez polskich znaków, spacje itp.)."""
+    if not isinstance(name, str):
+        name = str(name)
+    name = name.strip().lower()
     trans = str.maketrans("ąćęłńóśźż", "acelnoszz")
-    return (
-        str(name)
-        .lower()
-        .translate(trans)
-        .replace(" ", "")
-    )
+    name = name.translate(trans)
+    name = re.sub(r"[^a-z0-9]+", "", name)
+    return name
 
-# --------- WAGA NETTO Z PODSUMOWANIA ---------
-
+# =================== WAGA NETTO ===================
 
 def znajdz_wage_netto_podsumowanie(linie):
-    if not any("Ilość palet" in l for l in linie):
+    """
+    Szuka wagi netto w sekcji podsumowania:
+    - wiersz nagłówka zawiera 'Ilość palet' oraz 'Całkowita waga netto'
+    - wiersz z wartościami jest poniżej; bierzemy drugą liczbę (kolumna netto)
+    """
+    if not linie:
         return None
 
-    idx = None
+    header_idx = None
     for i, linia in enumerate(linie):
-        if (
-            "Całkowita waga netto" in linia
-            or "Total Net Weight" in linia
-            or "Całkowita objęto" in linia
-            or "Total Volume" in linia
+        if "Ilość palet" in linia and (
+            "Całkowita waga netto" in linia or "Total Net Weight" in linia
         ):
-            idx = i
-
-    if idx is None:
+            header_idx = i
+            break
+    if header_idx is None:
+        # fallback - szukamy samej frazy
+        for i, linia in enumerate(linie):
+            if "Całkowita waga netto" in linia or "Total Net Weight" in linia:
+                header_idx = i
+                break
+    if header_idx is None:
         return None
 
-    for linia in linie[idx + 1 : idx + 8]:
-        nums = re.findall(r"[0-9.,]+", linia)
-        values = []
-        for n in nums:
-            v = wyczysc_liczbe(n)
-            if v is not None:
-                values.append(v)
+    for j in range(header_idx + 1, min(header_idx + 7, len(linie))):
+        row = linie[j].strip()
+        if not row:
+            continue
+        nums = re.findall(r"[0-9.,]+", row)
+        values = [wyczysc_liczbe(n) for n in nums]
+        values = [v for v in values if v is not None]
         if len(values) >= 2:
-            return values[-1]
-
+            return values[1]
     return None
 
-
-# --------- NUMER PRZESYŁKI ---------
-
+# =================== NUMER PRZESYŁKI ===================
 
 def znajdz_numer_przesylki(linie):
     if not linie:
         return None
 
-    # klasyczny przypadek "Numer przesyłki"
+    # klasyczne "Numer przesyłki"
     for i, linia in enumerate(linie):
         low = linia.lower()
-        if ("numer przesy" in low) or ("nr przesy" in low):
+        if "numer przesy" in low or "nr przesy" in low:
             for j in range(i, min(i + 3, len(linie))):
                 nums = re.findall(r"\d{6,}", linie[j])
                 if nums:
                     return nums[-1]
 
-    # fallback po "QUALITY CERTIFICATE"
+    # fallback po QUALITY CERTIFICATE
     for i, linia in enumerate(linie):
         if "QUALITY CERTIFICATE" in linia.upper():
             for j in range(i + 1, min(i + 5, len(linie))):
                 nums = re.findall(r"\d{6,}", linie[j])
                 if nums:
                     return nums[-1]
-
     return None
 
-
-# --------- ADRES DOSTAWY z PDF (awaryjnie) ---------
-
+# =================== ADRES DOSTAWY ===================
 
 def znajdz_adres_dostawy(linie):
+    """Adres między 'Adresat/Consignee' a 'Adres nabywcy', bez adresu zakładu."""
+    if not linie:
+        return None
+
     start = None
     end = None
     for i, linia in enumerate(linie):
@@ -170,69 +176,25 @@ def znajdz_adres_dostawy(linie):
     if start is None or end is None or end <= start:
         return None
 
-    # wyciągamy blok między "Adresat/Consignee" a "Adres nabywcy"
     blok = [l.strip() for l in linie[start:end] if l.strip()]
     if not blok:
         return None
 
-    # czyścimy techniczne linie (nasz adres nadawcy itp.)
+    # czyścimy oczywisty adres zakładu (Niepruszewo / Kasztanowa / Buk)
     cleaned = []
     for l in blok:
-        if "Nadawca/Consignor" in l:
+        upper = l.upper()
+        if "NIEPRUSZEWO" in upper or "KASZTANOWA" in upper or "64-320" in upper or " BUK" in upper:
             continue
-        words = l.split()
-        # wyrzucamy NIEPRUSZEWO (żeby nie brać adresu zakładu)
-        words = [w for w in words if w.upper() != "NIEPRUSZEWO"]
-        if not words:
-            continue
-        cleaned.append(" ".join(words))
-
+        cleaned.append(l.strip())
     if not cleaned:
         return None
 
-    # dzielimy na segmenty po "POLAND" – każdy segment to jeden adres
-    segments = []
-    current = []
-    for l in cleaned:
-        current.append(l)
-        if l.strip().upper() == "POLAND":
-            segments.append(current)
-            current = []
-    if current:
-        segments.append(current)
+    text = " ".join(cleaned)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-    if not segments:
-        return None
-
-    # pierwszy segment to zazwyczaj zakład (Kasztanowa 4, BUK) – go pomijamy
-    def is_plant_segment(seg):
-        txt = " ".join(seg).upper()
-        return ("64-320" in txt) or (" BUK" in txt) or ("KASZTANOWA" in txt)
-
-    non_plant_segments = [seg for seg in segments if not is_plant_segment(seg)]
-
-    if non_plant_segments:
-        selected = non_plant_segments[0]
-    else:
-        # awaryjnie: bierzemy drugi segment jeśli jest,
-        # inaczej ostatni
-        if len(segments) >= 2:
-            selected = segments[1]
-        else:
-            selected = segments[-1]
-
-    selected = [s for s in selected if s.strip()]
-    if not selected:
-        return None
-
-    # wszystko w jednej linii ze spacjami
-    adres = " ".join(selected)
-    adres = re.sub(r"\s+", " ", adres).strip()
-    return adres
-
-
-# --------- GŁÓWNA LOGIKA: PDF ---------
-
+# =================== PRZETWARZANIE ZAMÓWIEŃ W PDF ===================
 
 def przetworz_zamowienia(pdf_path, numery_zamowien):
     wyniki = {
@@ -264,22 +226,29 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
 
             first_page_idx = strony[0]
 
+            # adres z PDF (zostanie potem nadpisany mapą, jeśli jest w ADRESY_ZLECEN)
             if wyniki[nr]["adres_dostawy"] is None:
                 adres = znajdz_adres_dostawy(pages_lines[first_page_idx])
                 if adres:
                     wyniki[nr]["adres_dostawy"] = adres
 
+            # numer przesyłki – szukamy na wszystkich stronach z tym zleceniem + ew. strona po
             if wyniki[nr]["numer_przesylki"] is None:
-                numer_p = znajdz_numer_przesylki(pages_lines[first_page_idx])
-                if numer_p is None:
-                    next_idx = first_page_idx + 1
-                    if next_idx < len(pages_lines):
-                        numer_p = znajdz_numer_przesylki(pages_lines[next_idx])
+                numer_p = None
+                for page_idx in strony:
+                    numer_p = znajdz_numer_przesylki(pages_lines[page_idx])
+                    if numer_p:
+                        break
+                if not numer_p:
+                    last_idx = max(strony)
+                    if last_idx + 1 < len(pages_lines):
+                        numer_p = znajdz_numer_przesylki(pages_lines[last_idx + 1])
                         if numer_p:
-                            strony_do_zachowania.add(next_idx)
+                            strony_do_zachowania.add(last_idx + 1)
                 if numer_p:
                     wyniki[nr]["numer_przesylki"] = numer_p
 
+            # waga netto – szukamy w podsumowaniach na stronach z tym zleceniem + ew. stronie po
             netto = None
             for idx in strony:
                 val = znajdz_wage_netto_podsumowanie(pages_lines[idx])
@@ -298,7 +267,7 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
 
             wyniki[nr]["netto"] = netto
 
-    # --------- NADPISANIE ADRESÓW Z MAPY ---------
+    # adresy nadpisujemy mapą z Excela (jeśli istnieje)
     for nr, dane in wyniki.items():
         addr = ADRESY_ZLECEN.get(str(nr))
         if addr:
@@ -306,18 +275,14 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
 
     return wyniki, strony_do_zachowania
 
-
-# --------- PARSOWANIE WKLEJONEGO TEKSTU (EXCEL → TEXTAREA) ---------
-
+# =================== PARSOWANIE WKLEJONEJ TABELI ===================
 
 def parse_groups_from_pasted(text: str):
     """
-    Oczekuje wklejonego tekstu z Excela (4 kolumny C–F):
-    ZLECENIE | ilość palet | przewoźnik | mp
-
-    Zwraca:
-      - groups: lista słowników (label, orders, mp, ilosc_pal_tekst, przewoznik)
-      - df_preview: DataFrame z danymi (ładna tabela do pokazania)
+    Oczekuje wklejonego tekstu z Excela:
+    - wariant A: z nagłówkiem kolumn: ZLECENIE | ilość palet | przewoźnik | mp
+    - wariant B: BEZ nagłówka – same dane w 4 kolumnach, w kolejności:
+        ZLECENIE | ilość palet | przewoźnik | mp
     """
     if not text.strip():
         raise ValueError("Pole z tabelą jest puste – wklej dane z Excela.")
@@ -328,27 +293,40 @@ def parse_groups_from_pasted(text: str):
     elif ";" in text:
         sep = ";"
     else:
-        sep = ","  # awaryjnie
+        sep = ","
 
+    # Najpierw próbujemy jak zwykle – z nagłówkiem
     buffer = io.StringIO(text.strip())
-    df = pd.read_csv(buffer, sep=sep, engine="python")
+    df_try = pd.read_csv(buffer, sep=sep, engine="python")
 
-    # mapowanie nazw kolumn
     norm_to_orig = {}
-    for col in df.columns:
+    for col in df_try.columns:
         norm = _normalize_colname(col)
         norm_to_orig[norm] = col
 
-    if "zlecenie" not in norm_to_orig:
-        raise ValueError("Nie znaleziono kolumny 'ZLECENIE' we wklejonych danych.")
+    has_header = "zlecenie" in norm_to_orig and "mp" in norm_to_orig
 
-    if "mp" not in norm_to_orig:
-        raise ValueError("Nie znaleziono kolumny 'mp' we wklejonych danych.")
-
-    col_zlec = norm_to_orig["zlecenie"]
-    col_mp = norm_to_orig["mp"]
-    col_ilosc = norm_to_orig.get("iloscpalet")
-    col_przew = norm_to_orig.get("przewoznik")
+    if has_header:
+        df = df_try
+        col_zlec = norm_to_orig["zlecenie"]
+        col_mp = norm_to_orig["mp"]
+        col_ilosc = norm_to_orig.get("iloscpalet")
+        col_przew = norm_to_orig.get("przewoznik")
+    else:
+        # brak prawidłowych nagłówków – traktujemy dane jako 4 kolumny bez nagłówka
+        buffer2 = io.StringIO(text.strip())
+        df = pd.read_csv(buffer2, sep=sep, header=None, engine="python")
+        if df.shape[1] < 4:
+            raise ValueError(
+                "W trybie bez nagłówków oczekuję 4 kolumn w kolejności: "
+                "ZLECENIE, ilość palet, przewoźnik, mp."
+            )
+        df = df.iloc[:, :4].copy()
+        col_zlec = "ZLECENIE"
+        col_ilosc = "ilosc_palet"
+        col_przew = "przewoznik"
+        col_mp = "mp"
+        df.columns = [col_zlec, col_ilosc, col_przew, col_mp]
 
     groups = []
     for _, row in df.iterrows():
@@ -388,22 +366,22 @@ def parse_groups_from_pasted(text: str):
     if not groups:
         raise ValueError("Nie udało się odczytać żadnych zleceń z wklejonej tabeli.")
 
-    # podgląd – bierzemy tylko sensowne kolumny
-    cols_for_preview = [c for c in [col_zlec, col_ilosc, col_przew, col_mp] if c is not None]
+    cols_for_preview = []
+    for c in [col_zlec, col_ilosc, col_przew, col_mp]:
+        if c is not None and c in df.columns:
+            cols_for_preview.append(c)
     df_preview = df[cols_for_preview].copy()
 
     return groups, df_preview
 
-
-# --------- PODSUMOWANIE GRUP ---------
-
+# =================== PODSUMOWANIE GRUP ===================
 
 def zbuduj_podsumowanie_grup(wyniki, groups):
     """
-    Tworzy DataFrame z podsumowaniem:
-    - sumuje wagę netto dla zleceń połączonych
-    - sumuje mp (ilość palet)
-    - IGNORUJE grupy, dla których żadne zlecenie nie istnieje w PDF
+    - Ilość palet (mp) – liczba z kolumny mp (sumowana)
+    - Ilość palet – tekst z Excela
+    - Jeżeli zlecenie jest łączone, adres bierzemy z tego zamówienia,
+      które ma większą wagę netto (jeśli brak wag – pierwszy dostępny adres).
     """
     rows = []
     total_netto = 0.0
@@ -418,30 +396,41 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
 
         netto_sum = 0.0
         any_netto = False
-        adres = None
         przesylki = []
+
+        # wybór adresu: wg największej wagi netto
+        best_addr = None
+        best_addr_netto = -1.0
+        fallback_addr = None
 
         any_data_for_group = False
 
         for nr in orders:
             d = wyniki.get(nr, {})
+
             if any(d.get(k) is not None for k in ("netto", "adres_dostawy", "numer_przesylki")):
                 any_data_for_group = True
 
             n = d.get("netto")
-            if n is not None:
+            v = wyczysc_liczbe(n)
+            if v is not None:
                 any_netto = True
-                val = wyczysc_liczbe(n)
-                if val is not None:
-                    netto_sum += val
-            if (adres is None) and d.get("adres_dostawy"):
-                adres = d["adres_dostawy"]
+                netto_sum += v
+
+                if d.get("adres_dostawy") and v > best_addr_netto:
+                    best_addr_netto = v
+                    best_addr = d["adres_dostawy"]
+
+            if fallback_addr is None and d.get("adres_dostawy"):
+                fallback_addr = d["adres_dostawy"]
+
             if d.get("numer_przesylki"):
                 przesylki.append(str(d["numer_przesylki"]))
 
-        # jeśli w PDF w ogóle nie ma tych zleceń → pomijamy cały wiersz
         if not any_data_for_group:
             continue
+
+        adres = best_addr if best_addr is not None else fallback_addr
 
         netto_value = netto_sum if any_netto else None
         if netto_value is not None:
@@ -477,15 +466,12 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
     df = pd.DataFrame(rows)
     return df, total_netto, total_palety
 
-
-# --------- ZBIORCZY LIST (PDF) ---------
-
+# =================== ZBIORCZY LIST (PDF) ===================
 
 def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
     c = canvas.Canvas(summary_path, pagesize=landscape(A4))
     width, height = landscape(A4)
 
-    # ----------------- NAGŁÓWEK -----------------
     def draw_header(title_suffix=""):
         c.setFont(FONT_NAME, 16)
         base_title = "Zbiorczy list przewozowy"
@@ -534,7 +520,6 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
         table_start_y = min(bottom_sender, bottom_logo) - 15
         return table_start_y
 
-    # ----------------- STOPKA -----------------
     def draw_footer():
         c.setFont(FONT_NAME, 10)
         y = 40
@@ -549,27 +534,16 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
         c.drawString(left_x, y - 20, line_text)
         c.drawString(right_x, y - 20, line_text)
 
-    # ----------------- POMOC: ŁAMANIE ADRESU -----------------
     def wrap_address(adres, max_chars=60):
-        """
-        Lepsze łamanie adresu:
-        - w pierwszej kolejności dzieli po przecinkach (każda część w nowej linii),
-        - jeśli część jest nadal za długa, dzieli po spacjach,
-        - nie ucina słów w połowie.
-        """
         if adres is None:
             return [""]
-
         text = str(adres).strip()
         if not text:
             return [""]
-
-        # najpierw próbujemy dzielić po przecinkach
         parts = [p.strip() for p in text.split(",") if p.strip()]
         lines = []
-
-        def split_long_part(part):
-            local_lines = []
+        def split_long(part):
+            local = []
             words = part.split()
             current = ""
             for w in words:
@@ -578,44 +552,34 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
                 elif len(current) + 1 + len(w) <= max_chars:
                     current += " " + w
                 else:
-                    local_lines.append(current)
+                    local.append(current)
                     current = w
             if current:
-                local_lines.append(current)
-            return local_lines
-
+                local.append(current)
+            return local
         if parts:
             for part in parts:
                 if len(part) <= max_chars:
                     lines.append(part)
                 else:
-                    lines.extend(split_long_part(part))
+                    lines.extend(split_long(part))
         else:
-            # brak przecinków – dzielimy po spacjach
-            lines.extend(split_long_part(text))
-
+            lines.extend(split_long(text))
         return lines or [""]
 
-    # ----------------- KONFIGURACJA TABELI (5 kolumn) -----------------
     start_y = draw_header()
     base_row_height = 26
 
-    # marginesy poziome 40 po lewej/prawej
     left_margin = 40
     right_margin = 40
+    available_width = width - left_margin - right_margin
 
-    # szerokości kolumn:
-    # 0: ZLECENIE
-    # 1: Ilość palet (mp)
-    # 2: Numery przesyłek
-    # 3: Całkowita waga netto (kg)
-    # 4: Adres
     col_widths = [
-        120,  # ZLECENIE
-        60,   # Ilość palet (mp)
-        130,  # Numery przesyłek
-        90,   # Waga netto
-        width - left_margin - right_margin - (120 + 60 + 130 + 90),  # Adres
+        0.10 * available_width,  # ZLECENIE
+        0.10 * available_width,  # Ilość palet (mp)
+        0.20 * available_width,  # Numery przesyłek
+        0.20 * available_width,  # Waga netto
+        0.40 * available_width,  # Adres
     ]
 
     col_x = [left_margin]
@@ -623,8 +587,8 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
         col_x.append(col_x[-1] + w)
 
     headers = [
-        "ZLECENIE ",
-        "Ilość palet ",
+        "ZLECENIE",
+        "Ilość palet (mp)",
         "Numery przesyłek",
         "Całkowita waga netto (kg)",
         "Adres dostawy",
@@ -648,68 +612,58 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
             c.rect(x, y - h, w, h)
 
             lines = texts_lines[i]
-            if not isinstance(lines, list):
-                lines = [lines]
+            if not isinstance(lines, (list, tuple)):
+                lines = [str(lines)]
 
-            font_size = 9 if bold_flags[i] else 8
-            c.setFont(FONT_NAME, font_size)
+            total_lines_height = len(lines) * line_height
+            start_y_text = y - (h + total_lines_height) / 2 + line_height
 
-            if len(lines) == 0:
-                continue
-            total_text_height = line_height * len(lines)
-            ty = y - 6 - (h - total_text_height) / 2
+            for j, txt in enumerate(lines):
+                txt = str(txt)
+                if bold_flags[i]:
+                    c.setFont(FONT_NAME, 10)
+                else:
+                    c.setFont(FONT_NAME, 9)
+                c.drawString(x + 3, start_y_text - j * line_height, txt)
 
-            for line in lines:
-                if isinstance(line, (int, float)):
-                    line = f"{float(line):.2f}"
-                line = "" if line is None else str(line)
-                c.drawString(x + 3, ty, line)
-                ty -= line_height
-
-    def new_page(title_suffix="(cd.)"):
+    def new_page(suffix="(cd.)"):
         c.showPage()
-        w, h = landscape(A4)
-        nonlocal width, height
-        width, height = w, h
-        return draw_header(title_suffix)
+        return draw_header(suffix)
 
     y = start_y
 
-    # nagłówek tabeli
     header_texts = split_header_texts()
     header_bold = [True] * len(headers)
     header_height = base_row_height
     draw_row_frame_and_text(y, header_height, header_texts, header_bold)
     y -= header_height
 
-    # dane – bez wiersza "RAZEM"
     records = df_summary[df_summary["ZLECENIE"] != "RAZEM"].to_dict("records")
 
     for rec in records:
         zlec = rec.get("ZLECENIE", "")
-        mp_val = rec.get("Ilość palet", "")
+        mp_val = rec.get("Ilość palet (mp)", "")
         przes = rec.get("Numery przesyłek", "")
         netto = rec.get("Całkowita waga netto (kg)", "")
         adres = rec.get("Adres dostawy", "")
 
-        # adres: lepsze łamanie
         adres_lines = wrap_address(adres, max_chars=60)
 
         lines_in_cell = max(1, len(adres_lines))
         row_height = max(base_row_height, lines_in_cell * 11 + 4)
 
-        if y - row_height < 70:
+        if y - row_height < 80:
             draw_footer()
-            y = new_page("(cd.)")
+            y = new_page()
             draw_row_frame_and_text(y, header_height, header_texts, header_bold)
             y -= header_height
 
         texts_lines = [
-            [str(zlec)],                        # ZLECENIE
-            ["" if mp_val is None else str(mp_val)],  # Ilość palet (opis z Excela)
-            [str(przes)],                       # Numery przesyłek
-            [f"{float(netto):.2f}"] if netto not in [None, ""] else [""],  # Waga
-            adres_lines,                        # Adres
+            [str(zlec)],
+            ["" if mp_val is None else str(mp_val)],
+            [str(przes)],
+            [f"{float(netto):.2f}"] if netto not in [None, ""] else [""],
+            adres_lines,
         ]
         bold_flags = [False] * len(headers)
 
@@ -719,19 +673,18 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
 
     y -= 10
 
-    # --------- PODSUMOWANIE: WAGA + ILOŚĆ PALET ---------
     row_height = base_row_height
     total_rows_height = row_height * 2
 
-    if y - total_rows_height < 70:
+    if y - total_rows_height < 80:
         draw_footer()
-        y = new_page("(cd.)")
+        y = new_page()
 
     big_width = sum(col_widths[:-1])
     last_x = col_x[-1]
     last_w = col_widths[-1]
 
-    # 1) CAŁKOWITA WAGA NETTO
+    # CAŁKOWITA WAGA NETTO
     c.rect(col_x[0], y - row_height, big_width, row_height)
     c.rect(last_x, y - row_height, last_w, row_height)
 
@@ -740,78 +693,66 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
     c.drawString(col_x[0] + 6, y - row_height / 2, label1)
 
     suma_txt = f"{round(total_netto, 2):.2f}"
-    bold_font_size = 12
-    c.setFont(FONT_NAME, bold_font_size)
+    c.setFont(FONT_NAME, 12)
     c.drawString(last_x + 6, y - row_height / 2, suma_txt)
-    c.drawString(last_x + 6.4, y - row_height / 2, suma_txt)
 
-    # 2) CAŁKOWITA ILOŚĆ PALET
     y -= row_height
+
+    # ILOŚĆ MIEJSC PALETOWYCH
     c.rect(col_x[0], y - row_height, big_width, row_height)
     c.rect(last_x, y - row_height, last_w, row_height)
 
-    label2 = "CAŁKOWITA ILOŚĆ MIEJSC PALETOWYCH"
+    label2 = "ILOŚĆ MIEJSC PALETOWYCH (mp)"
     c.setFont(FONT_NAME, 10)
     c.drawString(col_x[0] + 6, y - row_height / 2, label2)
 
-    palety_txt = (
-        f"{int(total_palety)}"
-        if total_palety is not None and float(total_palety).is_integer()
-        else f"{total_palety}"
-    )
-    c.setFont(FONT_NAME, bold_font_size)
-    c.drawString(last_x + 6, y - row_height / 2, palety_txt)
-    c.drawString(last_x + 6.4, y - row_height / 2, palety_txt)
+    if float(total_palety).is_integer():
+        suma_mp_txt = str(int(total_palety))
+    else:
+        suma_mp_txt = str(total_palety)
+
+    c.setFont(FONT_NAME, 12)
+    c.drawString(last_x + 6, y - row_height / 2, suma_mp_txt)
 
     draw_footer()
     c.showPage()
     c.save()
 
+# =================== SKLEJANIE PDF ===================
 
-# --------- PDF: ORYGINALNE STRONY + ZBIORCZY LIST ---------
-
-
-def zapisz_pdf_z_stronami(pdf_path, output_path, page_indices, summary_pdf_path=None):
-    reader = PdfReader(pdf_path)
+def zapisz_pdf_z_stronami(input_pdf_path, output_pdf_path, strony_do_zachowania, summary_pdf_path):
+    reader = PdfReader(input_pdf_path)
     writer = PdfWriter()
 
-    for idx in sorted(page_indices):
-        if 0 <= idx < len(reader.pages):
-            writer.add_page(reader.pages[idx])
+    sorted_strony = sorted(set(strony_do_zachowania))
+    for i in sorted_strony:
+        if 0 <= i < len(reader.pages):
+            writer.add_page(reader.pages[i])
 
-    if summary_pdf_path and os.path.exists(summary_pdf_path):
-        s_reader = PdfReader(summary_pdf_path)
-        for p in s_reader.pages:
-            writer.add_page(p)
+    with open(summary_pdf_path, "rb") as f:
+        summary_reader = PdfReader(f)
+        for page in summary_reader.pages:
+            writer.add_page(page)
 
-    if len(writer.pages) == 0:
-        raise ValueError("Brak stron do zapisania w nowym PDF (nic nie znaleziono).")
-
-    with open(output_path, "wb") as f:
+    with open(output_pdf_path, "wb") as f:
         writer.write(f)
 
-
-# --------- APLIKACJA STREAMLIT ---------
-
+# =================== STREAMLIT APP ===================
 
 def main():
-    st.title("Zbiorczy list przewozowy – wklejanie tabeli z Excela")
+    st.title("Zbiorczy list przewozowy – Kersia")
 
-    uploaded_pdf = st.file_uploader("Wybierz plik PDF z zamówieniami:", type=["pdf"])
+    st.write("1. Wgraj **oryginalny PDF**.")
+    st.write("2. Wklej z Excela tabelę (4 kolumny: ZLECENIE, ilość palet, przewoźnik, mp).")
+    st.write("   Możesz wkleić z nagłówkiem albo tylko same dane w tej kolejności.")
+    st.write("3. Kliknij przycisk, żeby wygenerować Excel i PDF z podsumowaniem.")
 
-    st.markdown(
-        "### 1. W Excelu zaznacz 4 kolumny (C–F)\n"
-        "- **ZLECENIE**\n"
-        "- **ilość palet** (opis – będzie w kolumnie 'Ilość palet')\n"
-        "- **przewoźnik**\n"
-        "- **mp** – liczba palet (będzie sumowana)\n\n"
-        "Skopiuj (**Ctrl+C**) i wklej (**Ctrl+V**) poniżej do pola tekstowego."
-    )
+    uploaded_pdf = st.file_uploader("Wgraj plik PDF", type=["pdf"])
 
+    st.subheader("Wklejona tabela z Excela – będzie użyta do podziału na grupy")
     tabela_text = st.text_area(
-        "Wklej tutaj dane skopiowane z Excela (C–F, mogą być z nagłówkiem):",
+        "Wklej tutaj dane skopiowane z Excela (C–F):",
         height=200,
-        placeholder="ZLECENIE\tilość palet\tprzewoźnik\tmp\n53493+53498\tkarton\tdpd\t1\n56997+56998\t1p\tdsv\t1",
     )
 
     if st.button("Generuj Excel + PDF (ze zbiorczą stroną)"):
@@ -825,72 +766,62 @@ def main():
             st.error(f"Błąd podczas interpretacji wklejonej tabeli: {e}")
             return
 
-        st.subheader("Wklejona tabela (rozbita jak w Excelu)")
+        st.subheader("Wklejona tabela (podgląd)")
         st.dataframe(df_preview, use_container_width=True)
 
-        all_orders = sorted({o for g in groups for o in g["orders"]})
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+            tmp_pdf.write(uploaded_pdf.getbuffer())
+            tmp_pdf_path = tmp_pdf.name
 
-        with st.spinner("Przetwarzanie..."):
-            tmp_pdf_path = None
+        try:
+            wszystkie_zamowienia = sorted({nr for g in groups for nr in g["orders"]})
+
+            wyniki, strony_do_zachowania = przetworz_zamowienia(tmp_pdf_path, wszystkie_zamowienia)
+
+            df_summary, total_netto, total_palety = zbuduj_podsumowanie_grup(wyniki, groups)
+
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer) as writer:
+                df_summary.to_excel(writer, index=False, sheet_name="Podsumowanie")
+            excel_buffer.seek(0)
+
+            st.subheader("Pobierz plik Excel")
+            st.download_button(
+                label="Pobierz podsumowanie (Excel)",
+                data=excel_buffer,
+                file_name="podsumowanie_zamowien.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_summary_pdf:
+                summary_pdf_path = tmp_summary_pdf.name
+
+            utworz_zbiorczy_pdf(summary_pdf_path, df_summary, total_netto, total_palety)
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_output_pdf:
+                output_pdf_path = tmp_output_pdf.name
+
+            zapisz_pdf_z_stronami(tmp_pdf_path, output_pdf_path, strony_do_zachowania, summary_pdf_path)
+
+            with open(output_pdf_path, "rb") as f:
+                out_pdf_bytes = f.read()
+
+            st.subheader("Pobierz PDF ze zbiorczą stroną")
+            st.download_button(
+                label="Pobierz zbiorczy list przewozowy (PDF)",
+                data=out_pdf_bytes,
+                file_name="zbiorczy_list_przewozowy.pdf",
+                mime="application/pdf",
+            )
+
+            st.subheader("Podsumowanie (tylko zlecenia znalezione w PDF)")
+            st.dataframe(df_summary, use_container_width=True)
+
+        finally:
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-                    tmp_pdf.write(uploaded_pdf.getbuffer())
-                    tmp_pdf_path = tmp_pdf.name
-
-                wyniki, strony = przetworz_zamowienia(tmp_pdf_path, all_orders)
-
-                if len(strony) == 0:
-                    st.error("Nie znaleziono żadnych stron z podanymi zleceniami w PDF.")
-                    return
-
-                df_summary, total_netto, total_palety = zbuduj_podsumowanie_grup(wyniki, groups)
-
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    today = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                    excel_path = os.path.join(tmpdir, f"list_przewozowy_v1_{today}.xlsx")
-                    pdf_path = os.path.join(tmpdir, f"list_przewozowy_v1_{today}.pdf")
-                    summary_temp = os.path.join(tmpdir, f"list_przewozowy_v1_{today}_zbiorczy_tmp.pdf")
-
-                    df_summary.to_excel(excel_path, index=False)
-
-                    df_for_pdf = df_summary[df_summary["ZLECENIE"] != "RAZEM"].copy()
-                    utworz_zbiorczy_pdf(summary_temp, df_for_pdf, total_netto, total_palety)
-
-                    zapisz_pdf_z_stronami(tmp_pdf_path, pdf_path, strony, summary_temp)
-
-                    with open(excel_path, "rb") as f:
-                        excel_bytes = f.read()
-                    with open(pdf_path, "rb") as f:
-                        pdf_bytes = f.read()
-
-                st.success("Gotowe! Poniżej możesz pobrać pliki.")
-                st.write(f"**Suma wag netto:** {round(total_netto, 2)} kg")
-                st.write(f"**Suma palet (mp, tylko dla zleceń znalezionych w PDF):** {total_palety}")
-
-                st.download_button(
-                    label="Pobierz Excel (z paletami)",
-                    data=excel_bytes,
-                    file_name=f"list_przewozowy_v1_{today}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-                st.download_button(
-                    label="Pobierz PDF (oryginalne strony + zbiorczy list)",
-                    data=pdf_bytes,
-                    file_name=f"list_przewozowy_v1_{today}.pdf",
-                    mime="application/pdf",
-                )
-
-                st.subheader("Podsumowanie (tylko zlecenia znalezione w PDF)")
-                st.dataframe(df_summary, use_container_width=True)
-
-            finally:
-                if tmp_pdf_path is not None:
-                    try:
-                        os.remove(tmp_pdf_path)
-                    except Exception:
-                        pass
-
+                os.remove(tmp_pdf_path)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
