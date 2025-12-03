@@ -1,4 +1,5 @@
 import re
+import io
 import pdfplumber
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
@@ -103,7 +104,7 @@ def znajdz_numer_przesylki(linie):
     for i, linia in enumerate(linie):
         if "QUALITY CERTIFICATE" in linia.upper():
             for j in range(i + 1, min(i + 5, len(linie))):
-                nums = re.findall(r"\d{6,}", linie[j])
+                nums = re.findall(r"\d{6,}", linia[j])
                 if nums:
                     return nums[-1]
 
@@ -245,32 +246,59 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
     return wyniki, strony_do_zachowania
 
 
-# --------- GRUPY ZE ZLECENIAMI (EXCEL) ---------
+# --------- PARSOWANIE WKLEJONEJ TABELI ---------
 
-def parse_groups_from_excel(file) -> list:
+def parse_groups_from_pasted(text: str):
     """
-    Odczytuje plik Excel i buduje listę grup:
-    [
-      { "label": "53493+53498", "orders": ["53493","53498"], "mp": 1 },
-      ...
-    ]
-    Wymagana kolumna: ZLECENIE
-    Opcjonalna: mp (ilość palet)
+    Oczekuje wklejonej tabeli z Excela (4 kolumny):
+    ZLECENIE | ilość palet | przewoźnik | mp
+    Rozpoznaje:
+      - kolumnę 'ZLECENIE' (zlecenia, mogą być łączone '+')
+      - kolumnę 'mp' (ilość palet)
     """
-    df = pd.read_excel(file)
-    df_columns = [str(c).strip() for c in df.columns]
-    df.columns = df_columns
+    if not text.strip():
+        raise ValueError("Pole z tabelą jest puste.")
 
-    if "ZLECENIE" not in df.columns:
-        raise ValueError("W Excelu musi być kolumna 'ZLECENIE' (dokładnie taka nazwa).")
+    # Najczęściej z Excela leci TSV (tabulatory)
+    if "\t" in text:
+        sep = "\t"
+    elif ";" in text:
+        sep = ";"
+    else:
+        sep = ","  # awaryjnie
+
+    buffer = io.StringIO(text.strip())
+    df = pd.read_csv(buffer, sep=sep, engine="python")
+
+    # Normalizacja nazw kolumn
+    norm_map = {}
+    for col in df.columns:
+        norm = (
+            str(col)
+            .strip()
+            .lower()
+            .replace(" ", "")
+            .replace("ł", "l")
+        )
+        norm_map[norm] = col
+
+    if "zlecenie" not in norm_map:
+        raise ValueError("Nie znaleziono kolumny 'ZLECENIE' w wklejonej tabeli.")
+
+    if "mp" not in norm_map:
+        raise ValueError("Nie znaleziono kolumny 'mp' w wklejonej tabeli.")
+
+    col_zlec = norm_map["zlecenie"]
+    col_mp = norm_map["mp"]
 
     groups = []
     for _, row in df.iterrows():
-        zlec = str(row.get("ZLECENIE", "")).strip()
+        zlec_raw = row.get(col_zlec, "")
+        zlec = str(zlec_raw).strip()
         if not zlec or zlec.lower() == "nan":
             continue
 
-        raw_mp = row.get("mp", None)
+        raw_mp = row.get(col_mp, None)
         mp_val = wyczysc_liczbe(raw_mp) if raw_mp is not None else None
 
         parts = [p.strip() for p in re.split(r"[+]", zlec) if p and str(p).strip().lower() != "nan"]
@@ -284,16 +312,15 @@ def parse_groups_from_excel(file) -> list:
         })
 
     if not groups:
-        raise ValueError("Nie znaleziono żadnych zleceń w kolumnie 'ZLECENIE'.")
+        raise ValueError("Nie udało się odczytać żadnych zleceń z wklejonej tabeli.")
     return groups
 
 
 def zbuduj_podsumowanie_grup(wyniki, groups):
     """
-    Tworzy DataFrame z podsumowaniem po wierszach Excela:
+    Tworzy DataFrame z podsumowaniem po wierszach (wg wklejonych zleceń):
     - sumuje wagę netto dla zleceń połączonych
     - sumuje mp
-    Zwraca: df, total_netto, total_palety
     """
     rows = []
     total_netto = 0.0
@@ -432,12 +459,11 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto):
     start_y = draw_header()
     base_row_height = 26
 
-    # 4 kolumny jak wcześniej (tytuły można zmienić)
     col_x = [40, 150, 280, 380]
     col_widths = [110, 120, 90, width - 380 - 40]
 
     headers = [
-        "ZLECENIE (wg Excela)",
+        "ZLECENIE (wg tabeli)",
         "Numery przesyłek",
         "Całkowita waga netto (kg)",
         "Adres dostawy",
@@ -493,7 +519,6 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto):
     draw_row_frame_and_text(y, header_height, header_texts, header_bold)
     y -= header_height
 
-    # wiersze (bez RAZEM)
     records = df_summary[df_summary["ZLECENIE"] != "RAZEM"].to_dict("records")
 
     for rec in records:
@@ -504,8 +529,7 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto):
 
         max_chars = 80
         adres_lines = []
-        tmp = adres
-        tmp = "" if tmp is None else str(tmp)
+        tmp = "" if adres is None else str(adres)
         while len(tmp) > max_chars:
             cut = tmp.rfind(",", 0, max_chars)
             if cut == -1:
@@ -589,29 +613,24 @@ def zapisz_pdf_z_stronami(pdf_path, output_path, page_indices, summary_pdf_path=
 
 # --------- APLIKACJA STREAMLIT ---------
 
-def parsuj_numery(tekst):
-    return [x.strip() for x in tekst.replace("\n", ",").split(",") if x.strip()]
-
-
 def main():
-    st.title("List przewozowy: Excel + PDF + zbiorczy list (wersja Streamlit v1 z Excelem)")
+    st.title("Zbiorczy list przewozowy – wklejana tabela z Excela")
 
     uploaded_pdf = st.file_uploader("Wybierz plik PDF z zamówieniami:", type=["pdf"])
-    uploaded_excel = st.file_uploader(
-        "Wybierz plik Excel ze zleceniami (kolumny: ZLECENIE, mp):",
-        type=["xlsx", "xls"],
+
+    st.markdown(
+        "### Wklej 4 kolumny z Excela (C–F)\n"
+        "- **ZLECENIE**\n"
+        "- **ilość palet** (może być ignorowana, używamy `mp`)\n"
+        "- **przewoźnik**\n"
+        "- **mp** – liczba palet (będzie sumowana)\n\n"
+        "Po skopiowaniu wierszy z Excela użyj **Ctrl+V** w polu poniżej."
     )
 
-    st.caption(
-        "Jeśli nie wgrasz Excela, możesz wpisać numery ręcznie poniżej (stary tryb). "
-        "Z Excela kolumna 'ZLECENIE' może zawierać zlecenia łączone, np. 53493+53498, "
-        "a kolumna 'mp' będzie zliczana jako ilość palet."
-    )
-
-    numery_input = st.text_area(
-        "Numery zamówień (fallback – tylko jeśli nie używasz Excela):",
-        height=80,
-        placeholder="Np. 123456, 234567, 345678",
+    tabela_text = st.text_area(
+        "Wklej tutaj dane skopiowane z Excela (łącznie z nagłówkami):",
+        height=200,
+        placeholder="ZLECENIE\tilość palet\tprzewoźnik\tmp\n53493+53498\tkarton\tdpd\t1\n56997+56998\t1p\tdsv\t1",
     )
 
     if st.button("Generuj Excel + PDF (ze zbiorczą stroną)"):
@@ -619,25 +638,13 @@ def main():
             st.error("Najpierw wgraj plik PDF.")
             return
 
-        # budujemy grupy
         try:
-            if uploaded_excel is not None:
-                groups = parse_groups_from_excel(uploaded_excel)
-                all_orders = sorted({o for g in groups for o in g["orders"]})
-            else:
-                tekst_numery = (numery_input or "").strip()
-                if not tekst_numery:
-                    st.error("Podaj numery zamówień albo wgraj Excel.")
-                    return
-                numery = parsuj_numery(tekst_numery)
-                if not numery:
-                    st.error("Nie udało się odczytać numerów zamówienia.")
-                    return
-                groups = [{"label": nr, "orders": [nr], "mp": None} for nr in numery]
-                all_orders = numery
+            groups = parse_groups_from_pasted(tabela_text)
         except Exception as e:
-            st.error(f"Błąd podczas odczytu Excela: {e}")
+            st.error(f"Błąd podczas interpretacji wklejonej tabeli: {e}")
             return
+
+        all_orders = sorted({o for g in groups for o in g["orders"]})
 
         with st.spinner("Przetwarzanie..."):
             try:
@@ -659,10 +666,8 @@ def main():
                     pdf_path = os.path.join(tmpdir, f"list_przewozowy_v1_{today}.pdf")
                     summary_temp = os.path.join(tmpdir, f"list_przewozowy_v1_{today}_zbiorczy_tmp.pdf")
 
-                    # zapisujemy Excel z podsumowaniem (z paletami + RAZEM)
                     df_summary.to_excel(excel_path, index=False)
 
-                    # do PDFa bierzemy wiersze bez "RAZEM"
                     df_for_pdf = df_summary[df_summary["ZLECENIE"] != "RAZEM"].copy()
                     utworz_zbiorczy_pdf(summary_temp, df_for_pdf, total_netto)
 
@@ -678,20 +683,20 @@ def main():
                 st.write(f"**Suma palet (mp):** {total_palety}")
 
                 st.download_button(
-                    label="Pobierz Excel (v1, z paletami)",
+                    label="Pobierz Excel (z paletami)",
                     data=excel_bytes,
                     file_name=f"list_przewozowy_v1_{today}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
                 st.download_button(
-                    label="Pobierz PDF (oryginalne strony + zbiorczy list, v1)",
+                    label="Pobierz PDF (oryginalne strony + zbiorczy list)",
                     data=pdf_bytes,
                     file_name=f"list_przewozowy_v1_{today}.pdf",
                     mime="application/pdf",
                 )
 
-                st.subheader("Podsumowanie (wg zleceń z Excela)")
+                st.subheader("Podsumowanie (wg wklejonych zleceń)")
                 st.dataframe(df_summary)
 
             finally:
