@@ -58,6 +58,16 @@ def wyczysc_liczbe(tekst):
         return None
 
 
+def _normalize_colname(name: str) -> str:
+    # normalizacja nazw kolumn (usuwamy polskie znaki, spacje)
+    trans = str.maketrans("ąćęłńóśźż", "acelnoszz")
+    return (
+        str(name)
+        .lower()
+        .translate(trans)
+        .replace(" ", "")
+    )
+
 # --------- WAGA NETTO Z PODSUMOWANIA ---------
 
 def znajdz_wage_netto_podsumowanie(linie):
@@ -93,21 +103,19 @@ def znajdz_wage_netto_podsumowanie(linie):
 # --------- NUMER PRZESYŁKI ---------
 
 def znajdz_numer_przesylki(linie):
-    # zabezpieczenie gdy lista pusta
     if not linie:
         return None
 
-    # 1) klasyczny przypadek "Numer przesyłki"
+    # klasyczny przypadek "Numer przesyłki"
     for i, linia in enumerate(linie):
         low = linia.lower()
         if ("numer przesy" in low) or ("nr przesy" in low):
             for j in range(i, min(i + 3, len(linie))):
-                # POPRAWKA: linie[j], a nie linia[j]
-                nums = re.findall(r"\d{6,}", linie[j])
+                nums = re.findall(r"\d{6,}", linie[j])  # poprawka: linie[j]
                 if nums:
                     return nums[-1]
 
-    # 2) fallback po "QUALITY CERTIFICATE"
+    # fallback po "QUALITY CERTIFICATE"
     for i, linia in enumerate(linie):
         if "QUALITY CERTIFICATE" in linia.upper():
             for j in range(i + 1, min(i + 5, len(linie))):
@@ -257,46 +265,41 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
 
 def parse_groups_from_pasted(text: str):
     """
-    Oczekuje wklejonej tabeli z Excela (4 kolumny):
+    Wklejasz 4 kolumny z Excela:
     ZLECENIE | ilość palet | przewoźnik | mp
-    Rozpoznaje:
-      - kolumnę 'ZLECENIE' (zlecenia, mogą być łączone '+')
-      - kolumnę 'mp' (ilość palet)
+
+    Zwraca:
+      - groups: lista słowników (label, orders, mp, ilosc_pal_tekst, przewoznik)
+      - df_input: DataFrame z wklejonymi danymi (do podglądu)
     """
     if not text.strip():
         raise ValueError("Pole z tabelą jest puste.")
 
-    # Najczęściej z Excela leci TSV (tabulatory)
     if "\t" in text:
         sep = "\t"
     elif ";" in text:
         sep = ";"
     else:
-        sep = ","  # awaryjnie
+        sep = ","  # awaryjnie, gdyby ktoś użył CSV
 
     buffer = io.StringIO(text.strip())
     df = pd.read_csv(buffer, sep=sep, engine="python")
 
-    # Normalizacja nazw kolumn
-    norm_map = {}
+    norm_to_orig = {}
     for col in df.columns:
-        norm = (
-            str(col)
-            .strip()
-            .lower()
-            .replace(" ", "")
-            .replace("ł", "l")
-        )
-        norm_map[norm] = col
+        norm = _normalize_colname(col)
+        norm_to_orig[norm] = col
 
-    if "zlecenie" not in norm_map:
+    if "zlecenie" not in norm_to_orig:
         raise ValueError("Nie znaleziono kolumny 'ZLECENIE' w wklejonej tabeli.")
 
-    if "mp" not in norm_map:
+    if "mp" not in norm_to_orig:
         raise ValueError("Nie znaleziono kolumny 'mp' w wklejonej tabeli.")
 
-    col_zlec = norm_map["zlecenie"]
-    col_mp = norm_map["mp"]
+    col_zlec = norm_to_orig["zlecenie"]
+    col_mp = norm_to_orig["mp"]
+    col_ilosc = norm_to_orig.get("iloscpalet")  # kolumna 'ilość palet'
+    col_przew = norm_to_orig.get("przewoznik")
 
     groups = []
     for _, row in df.iterrows():
@@ -308,6 +311,18 @@ def parse_groups_from_pasted(text: str):
         raw_mp = row.get(col_mp, None)
         mp_val = wyczysc_liczbe(raw_mp) if raw_mp is not None else None
 
+        ilosc_pal_txt = None
+        if col_ilosc is not None:
+            ilosc_pal_txt = row.get(col_ilosc, None)
+            if pd.isna(ilosc_pal_txt):
+                ilosc_pal_txt = None
+
+        przew = None
+        if col_przew is not None:
+            przew = row.get(col_przew, None)
+            if pd.isna(przew):
+                przew = None
+
         parts = [p.strip() for p in re.split(r"[+]", zlec) if p and str(p).strip().lower() != "nan"]
         if not parts:
             continue
@@ -316,18 +331,25 @@ def parse_groups_from_pasted(text: str):
             "label": zlec,
             "orders": parts,
             "mp": mp_val,
+            "ilosc_pal_tekst": ilosc_pal_txt,
+            "przewoznik": przew,
         })
 
     if not groups:
         raise ValueError("Nie udało się odczytać żadnych zleceń z wklejonej tabeli.")
-    return groups
+
+    # DataFrame do podglądu – bierzemy tylko istniejące kolumny
+    cols_for_preview = [c for c in [col_zlec, col_ilosc, col_przew, col_mp] if c is not None]
+    df_preview = df[cols_for_preview].copy()
+
+    return groups, df_preview
 
 
 def zbuduj_podsumowanie_grup(wyniki, groups):
     """
-    Tworzy DataFrame z podsumowaniem po wierszach (wg wklejonych zleceń):
+    Tworzy DataFrame z podsumowaniem:
     - sumuje wagę netto dla zleceń połączonych
-    - sumuje mp
+    - sumuje mp (ilość palet)
     """
     rows = []
     total_netto = 0.0
@@ -337,6 +359,8 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
         label = g["label"]
         orders = g["orders"]
         mp = g.get("mp")
+        ilosc_txt = g.get("ilosc_pal_tekst")
+        przew = g.get("przewoznik")
 
         netto_sum = 0.0
         any_netto = False
@@ -368,6 +392,8 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
         rows.append({
             "ZLECENIE": label,
             "Ilość palet (mp)": mp,
+            "Ilość palet": ilosc_txt,
+            "Przewoźnik": przew,
             "Numery zamówień": "+".join(orders),
             "Numery przesyłek": "+".join(sorted(set(przesylki))) if przesylki else "",
             "Całkowita waga netto (kg)": round(netto_value, 2) if netto_value is not None else None,
@@ -377,6 +403,8 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
     rows.append({
         "ZLECENIE": "RAZEM",
         "Ilość palet (mp)": total_palety,
+        "Ilość palet": "",
+        "Przewoźnik": "",
         "Numery zamówień": "",
         "Numery przesyłek": "",
         "Całkowita waga netto (kg)": round(total_netto, 2),
@@ -389,7 +417,7 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
 
 # --------- ZBIORCZY LIST (PDF) ---------
 
-def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto):
+def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
     """
     df_summary – DataFrame z wierszami (bez wiersza 'RAZEM').
     Kolumny używane:
@@ -571,27 +599,45 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto):
 
     y -= 10
 
+    # --------- DWIE RAMKI: WAGA + ILOŚĆ PALET ---------
     row_height = base_row_height
-    if y - row_height < 70:
+    total_rows_height = row_height * 2
+
+    if y - total_rows_height < 70:
         draw_footer()
         y = new_page("(cd.)")
 
     big_width = col_widths[0] + col_widths[1] + col_widths[2]
+
+    # 1) CAŁKOWITA WAGA NETTO
     c.rect(col_x[0], y - row_height, big_width, row_height)
     c.rect(col_x[3], y - row_height, col_widths[3], row_height)
 
-    label = "CAŁKOWITA WAGA NETTO (kg)"
+    label1 = "CAŁKOWITA WAGA NETTO (kg)"
     c.setFont(FONT_NAME, 10)
-    c.drawString(col_x[0] + 6, y - row_height / 2, label)
+    c.drawString(col_x[0] + 6, y - row_height / 2, label1)
 
     suma_txt = f"{round(total_netto, 2):.2f}"
     bold_font_size = 12
     c.setFont(FONT_NAME, bold_font_size)
     c.drawString(col_x[3] + 6, y - row_height / 2, suma_txt)
-    c.drawString(col_x[3] + 6.4, y - row_height / 2, suma_txt)
+    c.drawString(col_x[3] + 6.4, y - row_height / 2, suma_txt)  # lekkie pogrubienie
+
+    # 2) CAŁKOWITA ILOŚĆ PALET
+    y -= row_height
+    c.rect(col_x[0], y - row_height, big_width, row_height)
+    c.rect(col_x[3], y - row_height, col_widths[3], row_height)
+
+    label2 = "CAŁKOWITA ILOŚĆ PALET (mp)"
+    c.setFont(FONT_NAME, 10)
+    c.drawString(col_x[0] + 6, y - row_height / 2, label2)
+
+    palety_txt = f"{int(total_palety)}" if float(total_palety).is_integer() else f"{total_palety}"
+    c.setFont(FONT_NAME, bold_font_size)
+    c.drawString(col_x[3] + 6, y - row_height / 2, palety_txt)
+    c.drawString(col_x[3] + 6.4, y - row_height / 2, palety_txt)
 
     draw_footer()
-
     c.showPage()
     c.save()
 
@@ -626,16 +672,16 @@ def main():
     uploaded_pdf = st.file_uploader("Wybierz plik PDF z zamówieniami:", type=["pdf"])
 
     st.markdown(
-        "### Wklej 4 kolumny z Excela (C–F)\n"
+        "### 1. Skopiuj z Excela 4 kolumny (C–F)\n"
         "- **ZLECENIE**\n"
-        "- **ilość palet** (może być ignorowana, używamy `mp`)\n"
+        "- **ilość palet** (kolumna opisowa)\n"
         "- **przewoźnik**\n"
         "- **mp** – liczba palet (będzie sumowana)\n\n"
-        "Po skopiowaniu wierszy z Excela użyj **Ctrl+V** w polu poniżej."
+        "Następnie wklej dane poniżej (Ctrl+V)."
     )
 
     tabela_text = st.text_area(
-        "Wklej tutaj dane skopiowane z Excela (łącznie z nagłówkami):",
+        "Wklej tutaj dane skopiowane z Excela (razem z nagłówkami):",
         height=200,
         placeholder="ZLECENIE\tilość palet\tprzewoźnik\tmp\n53493+53498\tkarton\tdpd\t1\n56997+56998\t1p\tdsv\t1",
     )
@@ -646,10 +692,14 @@ def main():
             return
 
         try:
-            groups = parse_groups_from_pasted(tabela_text)
+            groups, df_input = parse_groups_from_pasted(tabela_text)
         except Exception as e:
             st.error(f"Błąd podczas interpretacji wklejonej tabeli: {e}")
             return
+
+        # podgląd wklejonej tabeli (ładna siatka jak w Excelu)
+        st.subheader("Wklejona tabela (z Excela)")
+        st.dataframe(df_input)
 
         all_orders = sorted({o for g in groups for o in g["orders"]})
 
@@ -676,7 +726,7 @@ def main():
                     df_summary.to_excel(excel_path, index=False)
 
                     df_for_pdf = df_summary[df_summary["ZLECENIE"] != "RAZEM"].copy()
-                    utworz_zbiorczy_pdf(summary_temp, df_for_pdf, total_netto)
+                    utworz_zbiorczy_pdf(summary_temp, df_for_pdf, total_netto, total_palety)
 
                     zapisz_pdf_z_stronami(tmp_pdf_path, pdf_path, strony, summary_temp)
 
@@ -686,7 +736,7 @@ def main():
                         pdf_bytes = f.read()
 
                 st.success("Gotowe! Poniżej możesz pobrać pliki.")
-                st.write(f"**Suma wag netto:** {round(total_netto,2)} kg")
+                st.write(f"**Suma wag netto:** {round(total_netto, 2)} kg")
                 st.write(f"**Suma palet (mp):** {total_palety}")
 
                 st.download_button(
