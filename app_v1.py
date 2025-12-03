@@ -93,18 +93,25 @@ def znajdz_wage_netto_podsumowanie(linie):
 # --------- NUMER PRZESYŁKI ---------
 
 def znajdz_numer_przesylki(linie):
+    # zabezpieczenie gdy lista pusta
+    if not linie:
+        return None
+
+    # 1) klasyczny przypadek "Numer przesyłki"
     for i, linia in enumerate(linie):
         low = linia.lower()
         if ("numer przesy" in low) or ("nr przesy" in low):
             for j in range(i, min(i + 3, len(linie))):
+                # POPRAWKA: linie[j], a nie linia[j]
                 nums = re.findall(r"\d{6,}", linie[j])
                 if nums:
                     return nums[-1]
 
+    # 2) fallback po "QUALITY CERTIFICATE"
     for i, linia in enumerate(linie):
         if "QUALITY CERTIFICATE" in linia.upper():
             for j in range(i + 1, min(i + 5, len(linie))):
-                nums = re.findall(r"\d{6,}", linia[j])
+                nums = re.findall(r"\d{6,}", linie[j])
                 if nums:
                     return nums[-1]
 
