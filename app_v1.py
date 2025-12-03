@@ -428,7 +428,7 @@ def zapisz_pdf_z_stronami(pdf_input, pdf_output, strony, summary_pdf_path):
 
     with open(pdf_input, "rb") as f:
         r = PdfReader(f)
-        for idx in sorted(st strony):
+        for idx in sorted(strony):
             if idx < len(r.pages):
                 writer.add_page(r.pages[idx])
 
