@@ -1,5 +1,4 @@
 import re
-import io
 import pdfplumber
 import pandas as pd
 from PyPDF2 import PdfReader, PdfWriter
@@ -269,42 +268,27 @@ def przetworz_zamowienia(pdf_path, numery_zamowien):
     return wyniki, strony_do_zachowania
 
 
-# --------- PARSOWANIE WKLEJONEGO TEKSTU (EXCEL → TEXTAREA) ---------
+# --------- PARSOWANIE TABELI (Z DATA_EDITOR) ---------
 
-def parse_groups_from_pasted(text: str):
+def parse_groups_from_df(df: pd.DataFrame):
     """
-    Oczekuje wklejonego tekstu z Excela (4 kolumny C–F):
-    ZLECENIE | ilość palet | przewoźnik | mp
-
-    Zwraca:
-      - groups: lista słowników (label, orders, mp, ilosc_pal_tekst, przewoznik)
-      - df_preview: DataFrame z danymi (ładna tabela do pokazania)
+    Oczekuje DataFrame z kolumnami:
+      ZLECENIE | ilość palet | przewoźnik | mp
+    (nazwy mogą mieć różne znaki, ważna jest treść)
     """
-    if not text.strip():
-        raise ValueError("Pole z tabelą jest puste – wklej dane z Excela.")
+    if df is None or df.empty:
+        raise ValueError("Tabela jest pusta – wklej dane z Excela do tabeli.")
 
-    # Excel kopiuje dane jako TSV (tabulatory)
-    if "\t" in text:
-        sep = "\t"
-    elif ";" in text:
-        sep = ";"
-    else:
-        sep = ","  # awaryjnie
-
-    buffer = io.StringIO(text.strip())
-    df = pd.read_csv(buffer, sep=sep, engine="python")
-
-    # mapowanie nazw kolumn
     norm_to_orig = {}
     for col in df.columns:
         norm = _normalize_colname(col)
         norm_to_orig[norm] = col
 
     if "zlecenie" not in norm_to_orig:
-        raise ValueError("Nie znaleziono kolumny 'ZLECENIE' we wklejonych danych.")
+        raise ValueError("Nie znaleziono kolumny 'ZLECENIE' w tabeli.")
 
     if "mp" not in norm_to_orig:
-        raise ValueError("Nie znaleziono kolumny 'mp' we wklejonych danych.")
+        raise ValueError("Nie znaleziono kolumny 'mp' w tabeli.")
 
     col_zlec = norm_to_orig["zlecenie"]
     col_mp = norm_to_orig["mp"]
@@ -315,7 +299,7 @@ def parse_groups_from_pasted(text: str):
     for _, row in df.iterrows():
         zlec_raw = row.get(col_zlec, "")
         zlec = str(zlec_raw).strip()
-        # pomijamy ewentualny nagłówek skopiowany jako wiersz
+        # pomijamy pusty wiersz i ew. nagłówek wklejony jako wiersz
         if not zlec or zlec.lower() == "nan" or _normalize_colname(zlec) == "zlecenie":
             continue
 
@@ -347,13 +331,9 @@ def parse_groups_from_pasted(text: str):
         })
 
     if not groups:
-        raise ValueError("Nie udało się odczytać żadnych zleceń z wklejonej tabeli.")
+        raise ValueError("Nie udało się odczytać żadnych zleceń z tabeli.")
 
-    # podgląd
-    cols_for_preview = [c for c in [col_zlec, col_ilosc, col_przew, col_mp] if c is not None]
-    df_preview = df[cols_for_preview].copy()
-
-    return groups, df_preview
+    return groups
 
 
 def zbuduj_podsumowanie_grup(wyniki, groups):
@@ -680,23 +660,32 @@ def zapisz_pdf_z_stronami(pdf_path, output_path, page_indices, summary_pdf_path=
 # --------- APLIKACJA STREAMLIT ---------
 
 def main():
-    st.title("Zbiorczy list przewozowy – wklejanie tabeli z Excela")
+    st.title("Zbiorczy list przewozowy – tabela jak w Excelu")
 
     uploaded_pdf = st.file_uploader("Wybierz plik PDF z zamówieniami:", type=["pdf"])
 
     st.markdown(
         "### 1. W Excelu zaznacz 4 kolumny (C–F)\n"
         "- **ZLECENIE**\n"
-        "- **ilość palet** (opis – będzie w Excelu jako kolumna 'Ilość palet')\n"
+        "- **ilość palet** (opis – będzie w Excelu w kolumnie 'Ilość palet')\n"
         "- **przewoźnik**\n"
         "- **mp** – liczba palet (będzie sumowana)\n\n"
-        "Skopiuj (**Ctrl+C**) i wklej (**Ctrl+V**) poniżej."
+        "Skopiuj (**Ctrl+C**) i wklej bezpośrednio do tabeli poniżej (**kliknij pierwszą komórkę → Ctrl+V**)."
     )
 
-    tabela_text = st.text_area(
-        "Wklej tutaj dane skopiowane z Excela (C–F, mogą być z nagłówkiem):",
-        height=200,
-        placeholder="ZLECENIE\tilość palet\tprzewoźnik\tmp\n53493+53498\tkarton\tdpd\t1\n56997+56998\t1p\tdsv\t1",
+    # Pusta tabela jak w Excelu – wąska kolumna "ilość palet"
+    empty_df = pd.DataFrame(columns=["ZLECENIE", "ilość palet", "przewoźnik", "mp"])
+    df_input = st.data_editor(
+        empty_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="input_table",
+        column_config={
+            "ZLECENIE": st.column_config.TextColumn("ZLECENIE", required=False),
+            "ilość palet": st.column_config.TextColumn("ilość palet", width="small"),
+            "przewoźnik": st.column_config.TextColumn("przewoźnik", required=False),
+            "mp": st.column_config.TextColumn("mp", width="small"),
+        },
     )
 
     if st.button("Generuj Excel + PDF (ze zbiorczą stroną)"):
@@ -705,13 +694,13 @@ def main():
             return
 
         try:
-            groups, df_preview = parse_groups_from_pasted(tabela_text)
+            groups = parse_groups_from_df(df_input)
         except Exception as e:
-            st.error(f"Błąd podczas interpretacji wklejonej tabeli: {e}")
+            st.error(f"Błąd w tabeli: {e}")
             return
 
-        st.subheader("Wklejona tabela (rozbita jak w Excelu)")
-        st.dataframe(df_preview, use_container_width=True)
+        st.subheader("Wklejona tabela (jak w Excelu)")
+        st.dataframe(df_input, use_container_width=True)
 
         all_orders = sorted({o for g in groups for o in g["orders"]})
 
