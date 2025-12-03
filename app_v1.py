@@ -779,7 +779,7 @@ def main():
             df_summary, total_netto, total_palety = zbuduj_podsumowanie_grup(wyniki, groups)
 
             excel_buffer = io.BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine="xlsxwriter") as writer:
+            with pd.ExcelWriter(excel_buffer) as writer:  # bez engine="xlsxwriter"
                 df_summary.to_excel(writer, index=False, sheet_name="Podsumowanie")
             excel_buffer.seek(0)
 
