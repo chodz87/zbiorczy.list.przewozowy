@@ -583,8 +583,8 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
         col_x.append(col_x[-1] + w)
 
     headers = [
-        "ZLECENIE (wg tabeli)",
-        "Ilość palet (mp)",
+        "ZLECENIE ",
+        "Ilość palet ",
         "Numery przesyłek",
         "Całkowita waga netto (kg)",
         "Adres dostawy",
