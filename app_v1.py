@@ -455,7 +455,7 @@ def zbuduj_podsumowanie_grup(wyniki, groups):
 
 # =================== ZBIORCZY LIST (PDF) ===================
 
-def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
+def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety, date_str):
     c = canvas.Canvas(summary_path, pagesize=landscape(A4))
     width, height = landscape(A4)
 
@@ -478,7 +478,6 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
             c.drawString(40, y_sender, line)
             y_sender -= 12
 
-        date_str = datetime.now().strftime("%Y-%m-%d")
         date_font_size = 10
         c.setFont(FONT_NAME, date_font_size)
         date_width = c.stringWidth(date_str, FONT_NAME, date_font_size)
@@ -521,14 +520,17 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
         c.drawString(left_x, y - 20, line_text)
         c.drawString(right_x, y - 20, line_text)
 
-    def wrap_address(adres, max_chars=60):
+    def wrap_address(adres, max_chars=55):
+        """Ładniejsze zawijanie – ciaśniej, żeby nie wychodziło z komórek."""
         if adres is None:
             return [""]
         text = str(adres).strip()
         if not text:
             return [""]
+
         parts = [p.strip() for p in text.split(",") if p.strip()]
         lines = []
+
         def split_long(part):
             local = []
             words = part.split()
@@ -544,6 +546,7 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
             if current:
                 local.append(current)
             return local
+
         if parts:
             for part in parts:
                 if len(part) <= max_chars:
@@ -590,21 +593,19 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
                 res.append([h])
         return res
 
-    # ====== TU JEST NOWA FUNKCJA Z WYŚRODKOWANIEM ======
     def draw_row_frame_and_text(y, h, texts_lines, bold_flags):
         """
-        Rysuje komórki tabeli z wyśrodkowaniem:
-        - poziomo (środek kolumny)
-        - pionowo (środek komórki)
+        Rysuje komórki tabeli z wyśrodkowaniem,
+        pilnuje też żeby tekst nie wyszedł poza komórkę (bezpieczny margines).
         """
         line_height = 11
         num_cols = len(col_x)
+        safe_margin = 3  # minimalny margines od linii komórki
 
         for i in range(num_cols):
             x = col_x[i]
             w = col_widths[i]
 
-            # ramka komórki
             c.rect(x, y - h, w, h)
 
             lines = texts_lines[i]
@@ -625,10 +626,16 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
 
             for j, txt in enumerate(lines):
                 text_width = c.stringWidth(txt, FONT_NAME, font_size)
-                text_x = x + (w / 2) - (text_width / 2)
+
+                # jeśli tekst się mieści – centrowanie,
+                # jeśli nie – wyrównanie do lewej z marginesem
+                if text_width <= w - 2 * safe_margin:
+                    text_x = x + (w - text_width) / 2
+                else:
+                    text_x = x + safe_margin
+
                 text_y = start_y - j * line_height
                 c.drawString(text_x, text_y, txt)
-    # ===================================================
 
     def new_page(suffix="(cd.)"):
         c.showPage()
@@ -651,7 +658,7 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
         netto = rec.get("Całkowita waga netto (kg)", "")
         adres = rec.get("Adres dostawy", "")
 
-        adres_lines = wrap_address(adres, max_chars=60)
+        adres_lines = wrap_address(adres)
 
         lines_in_cell = max(1, len(adres_lines))
         row_height = max(base_row_height, lines_in_cell * 11 + 4)
@@ -782,23 +789,29 @@ def main():
 
             df_summary, total_netto, total_palety = zbuduj_podsumowanie_grup(wyniki, groups)
 
+            # data używana i w nagłówku, i w nazwach plików
+            date_str = datetime.now().strftime("%Y-%m-%d")
+
             excel_buffer = io.BytesIO()
             with pd.ExcelWriter(excel_buffer) as writer:
                 df_summary.to_excel(writer, index=False, sheet_name="Podsumowanie")
             excel_buffer.seek(0)
 
+            excel_filename = f"podsumowanie_zamowien_{date_str}.xlsx"
+            pdf_filename = f"zbiorczy_list_przewozowy_{date_str}.pdf"
+
             st.subheader("Pobierz plik Excel")
             st.download_button(
                 label="Pobierz podsumowanie (Excel)",
                 data=excel_buffer,
-                file_name="podsumowanie_zamowien.xlsx",
+                file_name=excel_filename,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_summary_pdf:
                 summary_pdf_path = tmp_summary_pdf.name
 
-            utworz_zbiorczy_pdf(summary_pdf_path, df_summary, total_netto, total_palety)
+            utworz_zbiorczy_pdf(summary_pdf_path, df_summary, total_netto, total_palety, date_str)
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_output_pdf:
                 output_pdf_path = tmp_output_pdf.name
@@ -812,7 +825,7 @@ def main():
             st.download_button(
                 label="Pobierz zbiorczy list przewozowy (PDF)",
                 data=out_pdf_bytes,
-                file_name="zbiorczy_list_przewozowy.pdf",
+                file_name=pdf_filename,
                 mime="application/pdf",
             )
 
