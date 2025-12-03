@@ -445,6 +445,7 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
     c = canvas.Canvas(summary_path, pagesize=landscape(A4))
     width, height = landscape(A4)
 
+    # ----------------- NAGŁÓWEK -----------------
     def draw_header(title_suffix=""):
         c.setFont(FONT_NAME, 16)
         base_title = "Zbiorczy list przewozowy"
@@ -493,6 +494,7 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
         table_start_y = min(bottom_sender, bottom_logo) - 15
         return table_start_y
 
+    # ----------------- STOPKA -----------------
     def draw_footer():
         c.setFont(FONT_NAME, 10)
         y = 40
@@ -507,14 +509,82 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
         c.drawString(left_x, y - 20, line_text)
         c.drawString(right_x, y - 20, line_text)
 
+    # ----------------- POMOC: ŁAMANIE ADRESU -----------------
+    def wrap_address(adres, max_chars=60):
+        """
+        Lepsze łamanie adresu:
+        - w pierwszej kolejności dzieli po przecinkach (każda część w nowej linii),
+        - jeśli część jest nadal za długa, dzieli po spacjach,
+        - nie ucina słów w połowie.
+        """
+        if adres is None:
+            return [""]
+
+        text = str(adres).strip()
+        if not text:
+            return [""]
+
+        # najpierw próbujemy dzielić po przecinkach
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        lines = []
+
+        def split_long_part(part):
+            local_lines = []
+            words = part.split()
+            current = ""
+            for w in words:
+                if not current:
+                    current = w
+                elif len(current) + 1 + len(w) <= max_chars:
+                    current += " " + w
+                else:
+                    local_lines.append(current)
+                    current = w
+            if current:
+                local_lines.append(current)
+            return local_lines
+
+        if parts:
+            for part in parts:
+                if len(part) <= max_chars:
+                    lines.append(part)
+                else:
+                    lines.extend(split_long_part(part))
+        else:
+            # brak przecinków – dzielimy po spacjach
+            lines.extend(split_long_part(text))
+
+        return lines or [""]
+
+    # ----------------- KONFIGURACJA TABELI (5 kolumn) -----------------
     start_y = draw_header()
     base_row_height = 26
 
-    col_x = [40, 150, 280, 380]
-    col_widths = [110, 120, 90, width - 380 - 40]
+    # marginesy poziome 40 po lewej/prawej
+    left_margin = 40
+    right_margin = 40
+
+    # szerokości kolumn:
+    # 0: ZLECENIE
+    # 1: Ilość palet (mp)
+    # 2: Numery przesyłek
+    # 3: Całkowita waga netto (kg)
+    # 4: Adres
+    col_widths = [
+        120,  # ZLECENIE
+        60,   # Ilość palet (mp)
+        130,  # Numery przesyłek
+        90,   # Waga netto
+        width - left_margin - right_margin - (120 + 60 + 130 + 90),  # Adres
+    ]
+
+    col_x = [left_margin]
+    for w in col_widths[:-1]:
+        col_x.append(col_x[-1] + w)
 
     headers = [
         "ZLECENIE (wg tabeli)",
+        "Ilość palet (mp)",
         "Numery przesyłek",
         "Całkowita waga netto (kg)",
         "Adres dostawy",
@@ -531,7 +601,8 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
 
     def draw_row_frame_and_text(y, h, texts_lines, bold_flags):
         line_height = 11
-        for i in range(4):
+        num_cols = len(col_x)
+        for i in range(num_cols):
             x = col_x[i]
             w = col_widths[i]
             c.rect(x, y - h, w, h)
@@ -558,39 +629,32 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
     def new_page(title_suffix="(cd.)"):
         c.showPage()
         w, h = landscape(A4)
+        # width/height globalnie
         nonlocal width, height
         width, height = w, h
         return draw_header(title_suffix)
 
     y = start_y
 
+    # nagłówek tabeli
     header_texts = split_header_texts()
-    header_bold = [True, True, True, True]
+    header_bold = [True] * len(headers)
     header_height = base_row_height
     draw_row_frame_and_text(y, header_height, header_texts, header_bold)
     y -= header_height
 
+    # dane – bez wiersza "RAZEM"
     records = df_summary[df_summary["ZLECENIE"] != "RAZEM"].to_dict("records")
 
     for rec in records:
         zlec = rec.get("ZLECENIE", "")
+        mp_val = rec.get("Ilość palet (mp)", "")
         przes = rec.get("Numery przesyłek", "")
         netto = rec.get("Całkowita waga netto (kg)", "")
         adres = rec.get("Adres dostawy", "")
 
-        max_chars = 80
-        adres_lines = []
-        tmp = "" if adres is None else str(adres)
-        while len(tmp) > max_chars:
-            cut = tmp.rfind(",", 0, max_chars)
-            if cut == -1:
-                cut = max_chars
-            adres_lines.append(tmp[:cut].strip())
-            tmp = tmp[cut + 1 :].strip()
-        if tmp:
-            adres_lines.append(tmp)
-        if not adres_lines:
-            adres_lines = [""]
+        # adres: lepsze łamanie
+        adres_lines = wrap_address(adres, max_chars=60)
 
         lines_in_cell = max(1, len(adres_lines))
         row_height = max(base_row_height, lines_in_cell * 11 + 4)
@@ -602,12 +666,13 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
             y -= header_height
 
         texts_lines = [
-            [str(zlec)],
-            [str(przes)],
-            [f"{float(netto):.2f}"] if netto not in [None, ""] else [""],
-            adres_lines,
+            [str(zlec)],                        # ZLECENIE
+            ["" if mp_val is None else str(mp_val)],  # Ilość palet (mp)
+            [str(przes)],                       # Numery przesyłek
+            [f"{float(netto):.2f}"] if netto not in [None, ""] else [""],  # Waga
+            adres_lines,                        # Adres
         ]
-        bold_flags = [False, False, False, False]
+        bold_flags = [False] * len(headers)
 
         draw_row_frame_and_text(y, row_height, texts_lines, bold_flags)
         y -= row_height
@@ -615,7 +680,7 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
 
     y -= 10
 
-    # --------- DWIE RAMKI: WAGA + ILOŚĆ PALET ---------
+    # --------- PODSUMOWANIE: WAGA + ILOŚĆ PALET ---------
     row_height = base_row_height
     total_rows_height = row_height * 2
 
@@ -623,11 +688,14 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
         draw_footer()
         y = new_page("(cd.)")
 
-    big_width = col_widths[0] + col_widths[1] + col_widths[2]
+    # lewa ramka: wszystkie kolumny poza ostatnią
+    big_width = sum(col_widths[:-1])
+    last_x = col_x[-1]
+    last_w = col_widths[-1]
 
     # 1) CAŁKOWITA WAGA NETTO
     c.rect(col_x[0], y - row_height, big_width, row_height)
-    c.rect(col_x[3], y - row_height, col_widths[3], row_height)
+    c.rect(last_x, y - row_height, last_w, row_height)
 
     label1 = "CAŁKOWITA WAGA NETTO (kg)"
     c.setFont(FONT_NAME, 10)
@@ -636,26 +704,32 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
     suma_txt = f"{round(total_netto, 2):.2f}"
     bold_font_size = 12
     c.setFont(FONT_NAME, bold_font_size)
-    c.drawString(col_x[3] + 6, y - row_height / 2, suma_txt)
-    c.drawString(col_x[3] + 6.4, y - row_height / 2, suma_txt)
+    c.drawString(last_x + 6, y - row_height / 2, suma_txt)
+    # lekki "pogrubiony" efekt
+    c.drawString(last_x + 6.4, y - row_height / 2, suma_txt)
 
     # 2) CAŁKOWITA ILOŚĆ PALET
     y -= row_height
     c.rect(col_x[0], y - row_height, big_width, row_height)
-    c.rect(col_x[3], y - row_height, col_widths[3], row_height)
+    c.rect(last_x, y - row_height, last_w, row_height)
 
     label2 = "CAŁKOWITA ILOŚĆ PALET (mp)"
     c.setFont(FONT_NAME, 10)
     c.drawString(col_x[0] + 6, y - row_height / 2, label2)
 
-    palety_txt = f"{int(total_palety)}" if total_palety is not None and float(total_palety).is_integer() else f"{total_palety}"
+    palety_txt = (
+        f"{int(total_palety)}"
+        if total_palety is not None and float(total_palety).is_integer()
+        else f"{total_palety}"
+    )
     c.setFont(FONT_NAME, bold_font_size)
-    c.drawString(col_x[3] + 6, y - row_height / 2, palety_txt)
-    c.drawString(col_x[3] + 6.4, y - row_height / 2, palety_txt)
+    c.drawString(last_x + 6, y - row_height / 2, palety_txt)
+    c.drawString(last_x + 6.4, y - row_height / 2, palety_txt)
 
     draw_footer()
     c.showPage()
     c.save()
+
 
 
 # --------- PDF: ORYGINALNE STRONY + ZBIORCZY LIST ---------
