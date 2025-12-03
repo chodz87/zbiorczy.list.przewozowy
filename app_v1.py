@@ -648,7 +648,7 @@ def utworz_zbiorczy_pdf(summary_path, df_summary, total_netto, total_palety):
 
     for rec in records:
         zlec = rec.get("ZLECENIE", "")
-        mp_val = rec.get("Ilość palet (mp)", "")
+        mp_val = rec.get("Ilość palet", "")
         przes = rec.get("Numery przesyłek", "")
         netto = rec.get("Całkowita waga netto (kg)", "")
         adres = rec.get("Adres dostawy", "")
